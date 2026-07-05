@@ -69,7 +69,7 @@ Besides TrustMark, we also tested `dwtDct`, `dwtDctSvd`, and `rivaGan` (all via 
 
 ## How long it takes
 
-Roughly 10–20 minutes on CPU for the whole thing — most of that time goes into LPIPS checks while calibrating the copy attack's strength.
+Roughly 10–20 minutes on GPU for the whole thing — most of that time goes into LPIPS checks while calibrating the copy attack's strength.
 
 ## What you get out of it
 
