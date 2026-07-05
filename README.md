@@ -1,66 +1,80 @@
-# Stolen Model Detection
+# Watermark Forgery Attack
 
-This repository contains the code to reproduce our best leaderboard submission for the Stolen Model Detection task.
+This is the code behind our leaderboard submission for the Watermark Forging task (Team XXV).
 
-## Requirements
+## What you need
 
-Install dependencies:
+Install the dependencies:
 
 ```bash
-pip install torch torchvision pandas requests safetensors numpy
+pip install torch torchvision numpy pillow scipy lpips opencv-python trustmark "numpy<2.0" "scipy>=1.11" "lightning>=2.0"
 ```
 
-## Files Required
+TrustMark grabs its own pretrained weights the first time you run it, so you don't need to download anything separately or commit them to the repo. Everything here runs fine on CPU — no GPU needed.
 
-Place the following files in the same directory as `task_template.py`:
+## Files you'll need
 
-| File | Description |
+Drop `Dataset.zip` next to `task_template.py`. Once unzipped it should look like this:
+
+| Path | What's in it |
 |---|---|
-| `target_model/weights.safetensors` | Target ResNet-18 weights |
-| `target_model/train_main_idx.json` | Indices of the target's training samples in CIFAR-100 |
-| `suspect_models/suspect_000.safetensors` … `suspect_359.safetensors` | 360 suspect model checkpoints |
+| `Dataset/watermarked_sources/WM_1` … `WM_8` | 25 watermarked examples per scheme (8 schemes total, and we don't know upfront what any of them are) |
+| `Dataset/clean_targets/1.png` … `200.png` | 200 clean images we need to forge watermarks onto |
 
-All model files are available from `https://huggingface.co/SprintML/tml26_task2`. The script automatically resolves Git-LFS pointer files in-place, so a shallow clone without `git lfs` installed will still work.
+The clean targets come in three sizes (128×128, 256×256, 512×512), and each `WM_x` folder's sources are all one native resolution matching its 25-image block in the targets (`WM_1` → images 1–25, `WM_2` → 26–50, and so on up to `WM_8` → 176–200).
 
-CIFAR-100 is downloaded automatically on first run.
-
-## How to Run
+## Running it
 
 ```bash
 python task_template.py
 ```
 
-This will:
-1. Resolve any Git-LFS pointer files for the target and suspect models
-2. Download CIFAR-100 (if not already present) and build two probe sets:
-   - 2000 held-out test images (shared probe)
-   - 2000 images from the target's exact training set (`train_main_idx.json`)
-3. Load the target model and pre-compute five signals on the probe sets
-4. Score all 360 suspect models on the same five signals
-5. Rank-normalise scores to `[0, 1]`
-6. Save results to `SUBMISSION.csv` and `SUBMISSION_diagnostics.csv`
-7. Automatically submit to the leaderboard
+Here's what happens when you run it:
 
-## Method
+1. Unzips the dataset (only needs to do this once)
+2. Tries to identify each of the 8 watermark sets using TrustMark, checking all 3 of its public model variants
+3. Any set it actually manages to identify gets re-embedded using TrustMark's real encoder
+4. Everything else falls back to a calibrated copy attack
+5. Forges all 200 target images
+6. Spits out a quality report (LPIPS / S_qlt) and zips it all into `submission.zip`
 
-For each suspect we compare it to the target along five complementary signals:
+## How it actually works
 
-| Signal | What it captures | Weight |
+### Step 1 — figuring out what scheme each set uses
+
+For every one of the 8 sets, we decode all 25 sources with each TrustMark variant. We only trust an identification if it clears all three of these bars:
+
+| Check | Bar to clear | Why it matters |
 |---|---|---|
-| Layer-4 CKA | Deep representation similarity — robust to fine-tuning and pruning | 0.25 |
-| Output agreement (1 − JSD) | Softmax-distribution match — catches distilled / extracted models | 0.25 |
-| Logit correlation | Class-score structure preservation | 0.15 |
-| Prediction agreement | Top-1 fidelity | 0.15 |
-| Membership gap | Memorisation of the target's exact training samples | 0.20 |
+| Present rate | ≥ 0.75 | how often TrustMark's own detector says "yep, there's a watermark here" |
+| Consensus agreement | ≥ 0.82 | how consistently the sources decode to the same message (random noise usually lands around 0.5–0.75, real matches jump to 0.95+) |
+| Round-trip check | ≥ 0.95 | encode the message we found into a clean image, decode it back, see if we get the same thing — cheap way to catch false positives |
 
-The membership signal compares each suspect's confidence gap between the target's training samples and held-out test samples. A stolen or distilled model inherits the target's memorisation pattern and shows a similar gap; an independent model does not.
+If a set clears all three, we re-embed it with TrustMark's actual encoder and the message we recovered. This gets near-perfect detection with barely any visible quality loss.
 
-All signals are combined with a fixed weighted sum, then converted to a rank-percentile so the submission is a smooth continuous ranking, appropriate for the `TPR@5%FPR` evaluation metric.
+### Step 2 — copy attack for everything else
 
-## Expected Runtime
+For sets TrustMark can't identify, we fall back to a blackbox averaging attack (based on Yang et al.):
 
-Scoring 360 models takes approximately **2–4 hours** on a single GPU, depending on GPU speed. No reference model training is required.
+1. Take the average of the 25 watermarked sources at their native resolution, subtract the average clean image at that same resolution — that gives us a rough residual pattern
+2. Blur that residual heavily and subtract the blur, which strips out any general color tint that isn't actually part of the watermark
+3. Build a mask that favors regions where the pattern stays consistent across sources and downplays regions where it's just following the image content
+4. Binary-search the injection strength per set so the average quality loss (LPIPS) lands right at our budget — as strong a watermark as we can get away with
 
-## Output
+This works well against content-agnostic watermarks, but it hits a wall with content-adaptive neural ones — those embed differently depending on the image, so simple averaging can't fully recover them.
 
-Results are saved to `SUBMISSION.csv` with columns `id` and `score`, and automatically submitted to the leaderboard. A `SUBMISSION_diagnostics.csv` with all per-signal values is also written for inspection.
+### Other decoders we tried and ruled out
+
+Besides TrustMark, we also tested `dwtDct`, `dwtDctSvd`, and `rivaGan` (all via `imwatermark`), both public HiDDeN checkpoints, and VideoSeal (v0.0 and v1.0) — none of them showed anything beyond random noise on any of the 8 sets. We also looked at the residuals in frequency space (FFT) to check for any obvious structured patterns visually, just in case something jumped out that the decoders missed.
+
+## How long it takes
+
+Roughly 10–20 minutes on CPU for the whole thing — most of that time goes into LPIPS checks while calibrating the copy attack's strength.
+
+## What you get out of it
+
+A `submission.zip` with all 200 forged images, ready to upload. While it runs, you'll see a table showing what happened with each set (variant tried, present rate, agreement, round-trip score, and the final verdict), plus a quality summary at the end.
+
+## Best score so far
+
+**0.439026** on the leaderboard — we managed to genuinely crack one scheme (`WM_7`, turned out to be TrustMark-Q) and re-embed it properly, with the copy attack covering the other seven we couldn't identify.
